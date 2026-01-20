@@ -1,5 +1,5 @@
 %% ============================================================
-%  fusi_video_soner3.m
+%  fusi_video_soner4.m
 %  fUSI VIDEO ANALYSIS GUI (MATLAB 2017b)
 %
 %  KEY FEATURE (requested):
@@ -270,6 +270,17 @@ uicontrol('Style','text','Units','pixels',...
     'HorizontalAlignment','left',...
     'FontName',uiFontName,'FontSize',11);
 
+applyAllMaskBtn = uicontrol('Style','pushbutton', ...
+    'Units','pixels', ...
+    'Position',[rightX-20 118 295 36], ...   % wider so text fits
+    'String','Apply current mask to ALL frames', ...
+    'FontName',uiFontName, ...
+    'FontSize',12, ...
+    'FontWeight','bold', ...
+    'ForegroundColor','w', ...
+    'BackgroundColor',[0.25 0.55 0.25], ...
+    'Callback',@applyMaskToAllFrames);
+
 % Help + Close
 helpBtn = uicontrol('Style','pushbutton','String','HELP',...
     'Units','pixels','Position',[rightX-20 78 105 32],...
@@ -316,7 +327,7 @@ maskIsInclude = true;
 
 % brush
 brushRadius = 4;
-maskAlpha = 0.15;
+maskAlpha = 0.35;
 maskColor = [0 1 0];
 
 % strict mode selection used for AUTO MASK
@@ -769,6 +780,25 @@ end
         render();
     end
 
+function applyMaskToAllFrames(~,~)
+
+    refMask = mask(:,:,frame);
+
+    if ~any(refMask(:))
+        statusLine = 'Current frame mask is empty — nothing to apply.';
+        render();
+        return;
+    end
+
+    for k = 1:nFrames
+        mask(:,:,k) = refMask;
+    end
+
+    statusLine = sprintf('Mask from frame %d applied to ALL frames.', frame);
+    render();
+end
+
+
     function autoMaskButton(~,~)
         autoMask();
     end
@@ -806,48 +836,49 @@ end
     end
 
 %% ---------------- MOUSE PAINT ----------------
-    function mouseDown(~,~)
-        if playing, return; end
-        if ~editorMode, return; end
+   function mouseDown(~,~)
+    if playing, return; end
+    if ~editorMode, return; end
 
-        mouseIsDown = true;
+    mouseIsDown = true;
 
-        sel = get(fig,'SelectionType');
-        if strcmp(sel,'normal')
-            paintMode = 'add';
-        elseif strcmp(sel,'alt')
-            paintMode = 'remove';
-        else
-            paintMode = '';
-            mouseIsDown = false;
-            return;
-        end
-
-        applyPaintAtCursor();
+    sel = get(fig,'SelectionType');
+    if strcmp(sel,'normal')
+        paintMode = 'add';        % LEFT click
+    elseif strcmp(sel,'alt')
+        paintMode = 'remove';     % RIGHT click
+    else
+        paintMode = '';
+        mouseIsDown = false;
+        return;
     end
+
+    applyPaintAtCursor();
+end
+
+function mouseUp(~,~)
+    mouseIsDown = false;
+    paintMode   = '';
+end
 
     function mouseMove(~,~)
 
-        % Always cache last mouse pos for Fill 'F'
-        cp = get(ax,'CurrentPoint');
-        x = cp(1,1);
-        y = cp(1,2);
-        if x>=1 && x<=nx && y>=1 && y<=nz
-            lastMouseXY = [x y];
-        end
-
-        if ~mouseIsDown, return; end
-        if playing, return; end
-        if ~editorMode, return; end
-        if isempty(paintMode), return; end
-
-        applyPaintAtCursor();
+    % Cache mouse position for Fill (F)
+    cp = get(ax,'CurrentPoint');
+    x = cp(1,1);
+    y = cp(1,2);
+    if x>=1 && x<=nx && y>=1 && y<=nz
+        lastMouseXY = [x y];
     end
 
-    function mouseUp(~,~)
-        mouseIsDown=false;
-        paintMode='';
-    end
+    if ~mouseIsDown, return; end
+    if playing, return; end
+    if ~editorMode, return; end
+    if isempty(paintMode), return; end
+
+    applyPaintAtCursor();
+end
+
 
     function applyPaintAtCursor()
 
