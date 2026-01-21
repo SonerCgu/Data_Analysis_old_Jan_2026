@@ -1,0 +1,2002 @@
+%% =========================================================================
+%   ALGORITHM & WORKFLOW — fUSI_Live_v8 by Soner Caner Cagun - MPI
+%   Biological Cybernetics Tübingen - December 2025
+%   Purpose: Fast, interactive visualization of 3D/4D fUSI time-series data
+%            with live ROI preview, PSC mode, normalization, and filtering.
+%
+%   OVERVIEW:
+%   ---------
+%   This GUI loads a .mat file containing fUSI data and metadata, detects
+%   the main imaging array, computes initial %Signal Change (PSC), and
+%   enables the user to visualize frames, navigate slices, extract ROI
+%   time-courses, and apply real-time filtering. The tool is optimized for
+%   speed (FAST mode) and smooth user interaction.
+%
+%   ------------------------------------------------------------------------
+%   MAIN WORKFLOW STEPS
+%   ------------------------------------------------------------------------
+%
+%   1.  File Input
+%       • User selects *.mat file
+%       • Load file and retrieve metadata (voxelSize, time vector, etc.)
+%
+%   2.  Data Detection
+%       • Automatically identify the largest numeric array (3D/4D)
+%       • Determine acquisition type:
+%            - Daxasonics = 3D (Ny × Nx × T)
+%            - Matrix probe = 4D (Ny × Nx × Nz × T)
+%
+%   3.  TR Determination
+%       • If metadata.time exists ? compute TR
+%       • Otherwise ? ask user for TR
+%
+%   4.  Initial PSC Calculation
+%       • Compute baseline (mean of first Nbaseline frames)
+%       • Compute PSC = (I - baseline) / baseline * 100
+%
+%   5.  GUI Creation
+%       • Main figure with:
+%            - Left sidebar (controls)
+%            - Top image panel (ax1)
+%            - Bottom timecourse plot (ax2)
+%            - Playback controls
+%       • Two timers handle live updates:
+%            - refreshTimer: redraws image + ROI preview
+%            - playTimer: time-based playback
+%
+%   6.  Sidebar Controls
+%       • Display modes: Raw / Normalized / PSC
+%       • ROI size slider
+%       • Live ROI toggle (fast mode on/off)
+%       • Brightness, contrast, gamma, histogram equalization
+%       • Filtering (HP, LP, BP)
+%       • Slice selection (for 4D)
+%       • PSC panel (baseline start/end entry)
+%
+%   7.  Image Display
+%       • Frame loaded according to:
+%           - Current slice (for 4D)
+%           - Current time frame
+%       • Apply:
+%           - Normalization
+%           - Brightness/contrast
+%           - Gamma correction
+%           - Optional histogram equalization
+%       • Apply colormap
+%       • LEFT/RIGHT anatomical labels rendered at the top
+%
+%   8.  Live ROI Preview (FAST MODE)
+%       • When enabled:
+%           - Follows mouse position
+%           - Shows a dynamic ROI box
+%           - Extracts instantaneous timecourse
+%           - Normalizes / PSC / filters as needed
+%           - Updates green trace in ax2
+%
+%   9.  Manual ROI Placement
+%       • Left-click = add ROI (saved permanently)
+%       • Right-click = remove nearest ROI
+%       • Each ROI gets:
+%           - Rectangle drawn on ax1
+%           - Extracted full timecourse
+%           - Colored curve plotted in ax2
+%
+%   10. Playback Controls
+%       • Play/pause button
+%       • Time scrubber slider
+%       • Loop checkbox
+%       • Speed slider
+%       • Keyboard shortcuts:
+%           ?  right arrow = next slice
+%           ?  left arrow  = previous slice
+%           ?  increase ROI size
+%           ?  decrease ROI size
+%           SPACE = play/pause
+%
+%   11. Filtering (doFiltering)
+%       • Real-time digital filtering using Butterworth:
+%           - High-pass
+%           - Low-pass
+%           - Band-pass
+%       • Applied to ROI timecourses (live + saved)
+%
+%   12. PSC Recalculation
+%       • User enters new baseline start/end (in seconds)
+%       • Recompute PSC for whole dataset
+%       • Update display
+%
+%   13. Help Window
+%       • Opens a secondary GUI with quick documentation
+%
+%   14. Cleanup
+%       • On close: safely stop & delete both timers
+%       • Delete GUI figure
+%
+%   ------------------------------------------------------------------------
+%   DESIGN PHILOSOPHY
+%   ------------------------------------------------------------------------
+%   • FAST, lightweight, minimal overhead
+%   • All operations hidden behind timers for smooth animation
+%   • Avoids NIfTI conversion to maintain speed
+%   • Clean UI with no overlaps
+%   • Modular: updateFrame(), doFiltering(), recalcPSCfunc(), etc.
+%   • Neutral orientation ? labels added for neurological view (“Left/Right”)
+%% =========================================================================
+function fUSI_Live_v8
+%% =========================================================================
+%   fUSI_Live_v7 — CLEAN VERSION WITHOUT NIFTI EXPORT (FAST)
+%
+%   This GUI is designed for live visualization of functional ultrasound
+%   (fUSI) data. It removes all slow NIfTI export functionality to allow
+%   maximum interactivity, especially during live ROI preview and filtering.
+%
+%   MAIN FEATURES:
+%   ? Live ROI ON/OFF toggle to allow fast GUI rendering
+%   ? Three display modes (Raw, Normalized, and PSC)
+%   ? Real-time filtering engine (HP / LP / BP)
+%   ? Optimized sidebar layout to avoid overlap
+%   ? 3D Daxasonics & 4D Matrix Probe support
+%
+%   Author: Soner Caner Cagun
+%   Optimization & Cleanup: ChatGPT
+% =========================================================================
+
+clear; clc; close all;
+
+
+%% ========================================================================
+% (1) SELECT INPUT FILE (MAT file)
+% ========================================================================
+% This part opens a file selection dialog so the user can choose a MAT file
+% that contains the fUSI dataset. The file must include a numeric array and
+% a metadata struct, otherwise the script will stop.
+%
+% We use uigetfile to let the user browse interactively.
+%
+[fileName, filePath] = uigetfile('*.mat','Select fUSI MAT file');
+if isequal(fileName,0)
+    % If user cancels the file selector, exit gracefully.
+    return;
+end
+
+% Load the selected .mat file into a structure S. All variables inside the
+% MAT file are now accessible through fields of S.
+S = load(fullfile(filePath, fileName));
+
+% Extract all variable names contained in the MAT file. This helps us detect
+% which variable actually contains the large fUSI data array.
+vars = fieldnames(S);
+
+fprintf('\nLoaded file: %s\n', fileName);
+
+
+
+%% ========================================================================
+% (2) READ METADATA
+% ========================================================================
+% The script expects the MAT file to contain a "metadata" structure. This
+% structure MUST describe voxel dimensions and the time vector. Without
+% this, the GUI would not know image orientation or TR.
+%
+% Here we check if metadata exists, and if not, we stop with an error.
+%
+if ~isfield(S,'metadata')
+    warning('No metadata struct found — attempting legacy fallback.');
+
+    metadata = struct();
+
+    if isfield(S,'TR'), metadata.TR = S.TR; end
+    if isfield(S,'time'), metadata.time = S.time; end
+    if isfield(S,'voxelSize'), metadata.voxelSize = S.voxelSize; end
+
+else
+    metadata = S.metadata;
+end
+
+
+% Pull metadata locally for convenience.
+metadata = S.metadata;
+
+% Extract voxel size from metadata. These values define spatial resolution.
+% We set dz = 1 because the matrix probe data is already cubic or because
+% Daxasonics data is inherently 2D+T with single-slice thickness.
+% ---------- VOXEL SIZE (SAFE) ----------
+if isfield(metadata,'voxelSize') && numel(metadata.voxelSize) >= 2 ...
+        && all(isfinite(metadata.voxelSize(1:2)))
+    dx = metadata.voxelSize(1);
+    dy = metadata.voxelSize(2);
+else
+    warning('Voxel size missing in metadata — using pixel units.');
+    dx = 1;
+    dy = 1;
+end
+
+
+
+%% ========================================================================
+% (3) DETECT MAIN DATA ARRAY
+% ========================================================================
+% Since MAT file may contain multiple variables, we need to identify which
+% variable contains the actual fUSI time-series data.
+%
+% The logic:
+%   - Must be numeric
+%   - Must have 3 or more dimensions (X,Y,T) or (X,Y,Z,T)
+%   - Among multiple candidates, largest array = primary fUSI data
+%
+candidates = {};
+for i = 1:numel(vars)
+    % Check if variable is numeric and has at least 3 dimensions
+    if isnumeric(S.(vars{i})) && ndims(S.(vars{i})) >= 3
+        candidates{end+1} = vars{i};
+    end
+end
+
+% If no valid candidate found, the MAT file is invalid.
+if isempty(candidates)
+    error('No numeric fUSI data found in MAT file.');
+end
+
+% Choose the largest candidate (in total number of elements).
+[~, idx] = max(cellfun(@(v) numel(S.(v)), candidates));
+dataVar = candidates{idx};
+
+% Extract the main data array.
+I    = S.(dataVar);
+
+% Store array size and number of dimensions.
+sz   = size(I);
+dims = ndims(I);
+
+
+
+%% ========================================================================
+% (4) SYSTEM TYPE + DIMENSIONS
+% ========================================================================
+% Two types of data are supported:
+%   - dims == 3 ? Daxasonics linear probe:      (Y, X, T)
+%   - dims == 4 ? Matrix probe volumetric data: (Y, X, Z, T)
+%
+% Based on the dimension count we classify the dataset and extract variables:
+% Ny = height, Nx = width, Nz = depth (# of slices), T = # of frames.
+%
+if dims == 3
+    systemType = 'Daxasonics (3D Time-Series)';
+    Ny = sz(1);      % Height
+    Nx = sz(2);      % Width
+    T  = sz(3);      % Time
+    Nz = 1;          % Single slice
+else
+    systemType = 'Matrix Probe (4D Volumetric)';
+    Ny = sz(1);      % Height
+    Nx = sz(2);      % Width
+    Nz = sz(3);      % Slices
+    T  = sz(4);      % Time
+end
+
+
+
+%% ========================================================================
+% (5) DETERMINE TR (sampling rate)
+% ========================================================================
+% TR is the time between two frames. It is crucial for plotting timecourses
+% and converting frame index into seconds.
+%
+% If metadata contains a "time" vector, compute TR from it.
+% If not, ask user via dialog box (fallback).
+%
+if isfield(metadata,'time') && numel(metadata.time)>=2
+    dt = metadata.time(2) - metadata.time(1); % difference between first two time points
+
+    % Check if TR is within typical fUSI range (~0.32s)
+    if dt > 0.28 && dt < 0.34
+        TR = dt;
+        fprintf('Detected TR: %.3f s\n', TR);
+    else
+        % If metadata seems unreliable, fallback to default TR.
+        TR = 0.320;
+    end
+
+else
+    % No stored TR ? ask user manually (in milliseconds).
+    answ = inputdlg('Enter TR (ms):','TR Input',1,{'320'});
+    TR = str2double(answ{1})/1000;
+end
+
+
+
+%% ========================================================================
+% (6) PRINT SUMMARY TO COMMAND WINDOW
+% ========================================================================
+% This section prints an overview of dataset properties so the user can
+% verify the loaded file. It includes dimensions, TR, and total duration.
+%
+fprintf('\n=========== Dataset Summary ===========\n');
+fprintf('File:   %s\n', fileName);
+fprintf('System: %s\n', systemType);
+fprintf('Dims:   %s\n', mat2str(sz));
+fprintf('TR:     %.3f s\n', TR);
+fprintf('Duration: %.2f min\n', (T*TR)/60);
+fprintf('=======================================\n\n');
+
+
+
+%% ========================================================================
+% (7) INITIAL PSC CALCULATION
+% ========================================================================
+% PSC = % Signal Change relative to baseline
+%
+% We compute a default baseline using the first N = min(1000, T) frames.
+% These will be overwritten later if user chooses a different baseline.
+%
+% PSC formula:
+%     PSC = (I - baseline) ./ baseline * 100
+%
+Nbaseline = min(T,1000);
+
+if dims == 3
+    % 2D + time (single slice)
+    base = mean(I(:,:,1:Nbaseline),3);
+    PSC  = (I - base) ./ base * 100;
+else
+    % 3D + time (multiple slices)
+    base = mean(I(:,:,:,1:Nbaseline),4);
+    PSC  = bsxfun(@rdivide, bsxfun(@minus,I,base),base) * 100;
+end
+
+
+
+%% ========================================================================
+% INTERNAL GUI STATE VARIABLES
+% ========================================================================
+% These variables are used by the GUI during playback or interaction.
+%
+% rawMode:     display mode (1=raw, 2=normalized, 3=PSC)
+% currentFrame: frame index during playback/scrubbing
+% currentSpeed: playback speed multiplier
+% loopEnabled:  should playback wrap around at the end?
+% liveROI_enabled: disables ROI to maintain max frame rate when off
+%
+rawMode = 1;
+currentFrame = 1;
+currentSpeed = 1.0;
+loopEnabled = true;
+
+liveROI_enabled = false;   % Start in FAST mode ? ROI disabled initially
+
+
+
+%% =========================================================================
+% GUI CREATION (main window)
+% =========================================================================
+% This creates the main application window. The figure is black themed,
+% large enough to show the fUSI image, timecourse panel, and sidebar.
+%
+% Important callbacks:
+%   - WindowButtonDownFcn  ? mouse clicks
+%   - WindowScrollWheelFcn ? scroll wheel (slice navigation)
+%   - KeyPressFcn          ? keyboard shortcuts
+%
+fig = figure('Name',['fUSI Viewer v7 — ' systemType], ...
+    'Position',[20 20 2200 1200],...    % Large window
+    'Color','k',...
+    'MenuBar','none',...
+    'ToolBar','none',...
+    'WindowButtonDownFcn',@mouseClick,...
+    'WindowScrollWheelFcn',@mouseWheelScroll,...
+    'KeyPressFcn',@keyPressHandler);
+
+drawnow;
+
+
+
+%% =========================================================================
+% SIDEBAR CREATION (left panel)
+% =========================================================================
+% This panel contains ALL GUI buttons, sliders, and mode controls.
+% It is 20% width of the screen and stretches vertically.
+%
+sidebar = uipanel(fig,'Units','normalized',...
+    'Position',[0 0 0.20 1],...
+    'BackgroundColor',[0.12 0.12 0.12]);  % dark gray background
+
+% Section title
+uicontrol(sidebar,'Style','text','String','Live Viewer Controls',...
+    'Units','normalized','Position',[0.05 0.965 0.90 0.035],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',15,'FontWeight','bold');
+
+BOTTOM_RESERVED = 0.12;
+
+Y       = 0.915;     % start under top title
+dRow    = 0.022;     % label -> control (TIGHT)
+dBlock  = 0.036;     % control -> next label (NORMAL)
+sliderH = 0.020;
+
+
+
+
+%% =========================================================================
+% DISPLAY MODE DROPDOWN
+% =========================================================================
+% User chooses:
+%   Raw intensity
+%   Normalized intensity (auto-rescale)
+%   PSC (% signal change)
+%
+
+
+% --- DISPLAY MODE ---
+uicontrol(sidebar,'Style','text','String','Display Mode',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+displayDropdown = uicontrol(sidebar,'Style','popupmenu',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'String',{'Raw Intensity','Normalized','% Signal Change'},...
+    'Value',1,'FontSize',12,...
+    'BackgroundColor',[0.25 0.25 0.25],'ForegroundColor','w',...
+    'Callback',@togglePSCpanel);
+Y = Y - dBlock;
+
+%% =========================================================================
+% ROI SIZE (SLIDER)
+% =========================================================================
+% This slider lets the user control the size of the ROI (in pixels) when
+% clicking on the image. The ROI will always be a square centered on the
+% mouse position. Larger values capture more voxels for timecourse averages.
+%
+% --- ROI SIZE ---
+uicontrol(sidebar,'Style','text','String','ROI Size (px)',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+roiSlider = uicontrol(sidebar,'Style','slider',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'Min',2,'Max',150,'Value',10,...
+    'SliderStep',[1/150 10/150],...
+    'BackgroundColor',[0.3 0.3 0.3]);
+Y = Y - dBlock;
+
+
+
+
+%% =========================================================================
+% LIVE ROI PREVIEW BUTTON
+% =========================================================================
+% When ON:
+%   - A colored preview box follows the mouse pointer.
+%   - The corresponding timecourse of that ROI is shown live.
+%
+% When OFF:
+%   - ROI calculations are disabled for maximum performance.
+%   - This is useful for big 4D datasets where interactive speed matters.
+%
+% --- LIVE ROI PREVIEW ---
+uicontrol(sidebar,'Style','text','String','Live ROI Preview',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+liveROIbtn = uicontrol(sidebar,'Style','togglebutton',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'String','OFF','Value',0,...
+    'FontSize',12,'FontWeight','bold',...
+    'BackgroundColor',[0.40 0 0],...
+    'ForegroundColor','w',...
+    'Callback',@toggleLiveROI);
+Y = Y - dBlock;
+
+
+
+
+%% =========================================================================
+% BRIGHTNESS SLIDER
+% =========================================================================
+% This slider adds a constant offset to the normalized image before display.
+% Positive values brighten the image, negative values darken it.
+%
+% The display pipeline is:
+%       F = F * contrast + brightness
+% Then gamma and histogram equalization are optionally applied.
+%
+% --- BRIGHTNESS ---
+uicontrol(sidebar,'Style','text','String','Brightness',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+brightness = uicontrol(sidebar,'Style','slider',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'Min',-1,'Max',1,'Value',0,...
+    'BackgroundColor',[0.3 0.3 0.3]);
+Y = Y - dBlock;
+
+
+%% =========================================================================
+% CONTRAST SLIDER
+% =========================================================================
+% Contrast multiplies the normalized image by a scale factor.
+% Higher values increase dynamic range contrast.
+% Very high values may saturate bright regions.
+%
+uicontrol(sidebar,'Style','text','String','Contrast',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+contrast = uicontrol(sidebar,'Style','slider',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'Min',0.1,'Max',5,'Value',1,...          % default = 1 (no change)
+    'BackgroundColor',[0.3 0.3 0.3]);
+Y = Y - dBlock;
+
+
+
+%% =========================================================================
+% GAMMA SLIDER
+% =========================================================================
+% Gamma correction adjusts midtone brightness:
+%   - gamma > 1 darkens midtones
+%   - gamma < 1 brightens midtones
+%
+% Applied AFTER brightness/contrast but BEFORE histogram equalization.
+%
+uicontrol(sidebar,'Style','text','String','Gamma',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+gammaSlider = uicontrol(sidebar,'Style','slider',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'Min',0.1,'Max',5,'Value',1,...           % default = no gamma change
+    'BackgroundColor',[0.3 0.3 0.3]);
+Y = Y - dBlock;
+
+
+
+%% =========================================================================
+% COLORMAP DROPDOWN
+% =========================================================================
+% User can select between:
+%   - grayscale (default)
+%   - hot (thermal color map)
+%
+uicontrol(sidebar,'Style','text','String','Colormap',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13);
+Y = Y - dRow;
+
+mapDropdown = uicontrol(sidebar,'Style','popupmenu',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'String',{'gray','hot'},...        % list of available color maps
+    'FontSize',12,...
+    'BackgroundColor',[0.3 0.3 0.3],'ForegroundColor','w');
+Y = Y - dBlock;
+
+
+
+
+%% =========================================================================
+% HISTOGRAM EQUALIZATION CHECKBOX
+% =========================================================================
+% Histogram equalization automatically spreads intensity values across the
+% entire 0–1 range. It can improve contrast in low-dynamic-range frames.
+%
+% However, in functional data, histEQ may distort interpretation, so use it
+% carefully—best for visualization only.
+%
+histEQ = uicontrol(sidebar,'Style','checkbox',...
+    'String','Histogram Equalization',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',12);
+Y = Y - dBlock;
+
+%% =========================================================================
+% MOVING AVERAGE (SPIKE SUPPRESSION)
+%% =========================================================================
+uicontrol(sidebar,'Style','text','String','Spike Suppression (movmean)',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor',[1 0.8 0.4],...
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',13,'FontWeight','bold');
+Y = Y - dRow;
+
+% --- MOVING AVERAGE ROW (checkbox + window) ---
+movmeanToggle = uicontrol(sidebar,'Style','checkbox', ...
+    'String','Moving avg', ...
+    'Units','normalized','Position',[0.05 Y 0.35 0.030], ...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12], ...
+    'Value',0,'FontSize',12);
+
+uicontrol(sidebar,'Style','text','String','Window (s)', ...
+    'Units','normalized','Position',[0.42 Y 0.25 0.030], ...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12], ...
+    'FontSize',12);
+
+movmeanWindow = uicontrol(sidebar,'Style','edit', ...
+    'Units','normalized','Position',[0.72 Y 0.23 0.030], ...
+    'String','30', ...
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+
+Y = Y - dBlock;
+
+%% =========================================================================
+% DESPIKE (ROBUST MAD)
+%% =========================================================================
+despikeToggle = uicontrol(sidebar,'Style','checkbox', ...
+    'String','Despike', ...
+    'Units','normalized','Position',[0.05 Y 0.35 0.030], ...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12], ...
+    'Value',1,'FontSize',12);
+
+uicontrol(sidebar,'Style','text','String','Z-threshold', ...
+    'Units','normalized','Position',[0.42 Y 0.25 0.030], ...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12], ...
+    'FontSize',12);
+
+despikeZ = uicontrol(sidebar,'Style','edit', ...
+    'Units','normalized','Position',[0.72 Y 0.23 0.030], ...
+    'String','5', ...
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+
+Y = Y - dBlock;
+
+dYf = 0.028;   % tighter spacing for filtering controls only
+
+
+%% =========================================================================
+% FILTERING SECTION HEADER
+% =========================================================================
+% Filtering is applied ONLY to the timecourses (not the images!) to allow
+% clean frequency-based analysis. The filters include:
+%   - High-pass
+%   - Low-pass
+%   - Band-pass
+%   - None
+%
+Y = Y - 0.015;   % extra gap before Filtering section
+
+uicontrol(sidebar,'Style','text','String','Filtering',...
+    'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+    'ForegroundColor',[0.4 0.8 1],...      % cyan color section header
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',14,'FontWeight','bold');
+Y = Y - dRow;
+
+
+%% =========================================================================
+% FILTER TYPE DROPDOWN
+% =========================================================================
+% This menu selects the filter type. Changing to band-pass reveals both
+% cutoff fields, while HP/LP hide the unnecessary cutoff.
+%
+filterDropdown = uicontrol(sidebar,'Style','popupmenu',...
+    'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+    'String',{'None','High-pass','Low-pass','Band-pass'},...
+    'FontSize',12,...
+    'BackgroundColor',[0.3 0.3 0.3],'ForegroundColor','w',...
+    'Callback',@toggleBandpass);
+
+Y = Y - dBlock; ;
+
+
+
+
+%% =========================================================================
+% FILTER ORDER
+% =========================================================================
+% The Butterworth filter order determines sharpness:
+%   - Low order ? smoother transition
+%   - High order ? sharper cutoff but may distort waveform
+%
+% Default = 4 (commonly used for fUSI / fMRI).
+%
+uicontrol(sidebar,'Style','text','String','Order:',...
+    'Units','normalized','Position',[0.05 Y 0.22 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',12);
+
+filterOrder = uicontrol(sidebar,'Style','edit',...
+    'Units','normalized','Position',[0.31 Y 0.25 0.030],...
+    'String','4',...             % default filter order
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+Y = Y - dBlock; ;
+
+
+
+%% =========================================================================
+% LOW CUTOFF (HP or BP)
+% =========================================================================
+% For:
+%   High-pass ? this is the cutoff
+%   Band-pass ? this is the low cutoff
+%
+uicontrol(sidebar,'Style','text','String','Low cutoff (Hz)',...
+    'Units','normalized','Position',[0.05 Y 0.40 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',12);
+
+lowCut = uicontrol(sidebar,'Style','edit',...
+    'Units','normalized','Position',[0.55 Y 0.40 0.030],...
+    'String','0.05',...              % typical HP for fUSI: ~0.03–0.05 Hz
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+Y = Y - dYf;
+
+
+
+
+%% =========================================================================
+% HIGH CUTOFF (LP or BP)
+% =========================================================================
+% Only visible for BAND-PASS mode.
+%
+uicontrol(sidebar,'Style','text','String','High cutoff (Hz)',...
+    'Units','normalized','Position',[0.05 Y 0.40 0.030],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',12);
+
+highCut = uicontrol(sidebar,'Style','edit',...
+    'Units','normalized','Position',[0.55 Y 0.40 0.030],...
+    'String','0.20',...        % typical LP for fUSI: ~0.2 Hz
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+
+set(highCut,'Visible','off');  % hidden until band-pass is selected
+Y = Y - dBlock; ;
+
+%% =========================================================================
+% SLICE SLIDER (only shown for 4D matrix-probe data)
+% =========================================================================
+% For 4D datasets (X,Y,Z,T), the user needs to choose which Z-slice to view.
+% This slider appears only when dims == 4.
+%
+% For 3D Daxasonics (X,Y,T), we skip this since there is only one slice.
+%
+if dims == 4
+
+    % Label for the slice selector
+    uicontrol(sidebar,'Style','text','String','Slice (Z)',...
+        'Units','normalized','Position',[0.05 Y 0.90 0.030],...
+        'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+        'FontSize',13);
+    Y = Y - dY;
+
+    % Slider used to select the Z-slice. Value changes update the displayed frame.
+    sliceSlider = uicontrol(sidebar,'Style','slider',...
+        'Units','normalized','Position',[0.05 Y 0.90 sliderH],...
+        'Min',1,'Max',Nz,'Value',round(Nz/2),...     % start at middle slice
+        'SliderStep',[1/(Nz-1) 5/(Nz-1)],...
+        'BackgroundColor',[0.3 0.3 0.3]);
+    Y = Y - dY;
+
+else
+    sliceSlider = [];  % not used in 3D datasets
+end
+
+
+
+%% =========================================================================
+% PSC PANEL (baseline configuration)
+% =========================================================================
+% When the user selects "% Signal Change" display mode, this panel appears.
+% It allows setting:
+%   - Baseline start time (seconds)
+%   - Baseline end time   (seconds)
+%
+% Clicking "Recalculate PSC" recomputes PSC for the entire dataset.
+%
+PSCpanel = uipanel(sidebar,'Units','normalized',...
+    'Position',[0.02 0.075 0.96 0.060],...   % fixed area near lower-left
+    'BackgroundColor',[0.10 0.10 0.10],...
+    'BorderType','etchedin','Visible','off');   % hidden until mode=PSC
+
+% Panel title
+uicontrol(PSCpanel,'Style','text','String','% Signal Change Baseline (s)',...
+    'Units','normalized','Position',[0.05 0.62 0.90 0.28],...
+    'ForegroundColor',[0.4 1 0.4],...      % greenish title
+    'BackgroundColor',[0.10 0.10 0.10],...
+    'FontSize',12,'FontWeight','bold');
+
+% --- Baseline start label ---
+uicontrol(PSCpanel,'Style','text','String','Start',...
+    'Units','normalized','Position',[0.05 0.38 0.25 0.22],...
+    'ForegroundColor','w','BackgroundColor',[0.10 0.10 0.10],...
+    'FontSize',11);
+
+% --- Baseline start input (seconds) ---
+baseStart = uicontrol(PSCpanel,'Style','edit',...
+    'Units','normalized','Position',[0.35 0.38 0.25 0.25],...
+    'String','0',...
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+
+% --- Baseline end label ---
+uicontrol(PSCpanel,'Style','text','String','End',...
+    'Units','normalized','Position',[0.62 0.38 0.20 0.22],...
+    'ForegroundColor','w','BackgroundColor',[0.10 0.10 0.10],...
+    'FontSize',11);
+
+% --- Baseline end input ---
+% Default baseline end = (Nbaseline * TR) seconds.
+baseEnd = uicontrol(PSCpanel,'Style','edit',...
+    'Units','normalized','Position',[0.82 0.38 0.15 0.25],...
+    'String',num2str(Nbaseline*TR),...
+    'BackgroundColor',[0.2 0.2 0.2],'ForegroundColor','w');
+
+% --- Recalculate PSC button ---
+recalcBtn = uicontrol(PSCpanel,'Style','pushbutton',...
+    'String','Recalculate PSC',...
+    'Units','normalized','Position',[0.22 0.06 0.56 0.24],...
+    'FontSize',11,'FontWeight','bold',...
+    'BackgroundColor',[0.10 0.45 0.10],'ForegroundColor','w',...
+    'Callback',@recalcPSCfunc);
+
+PSCpanel.Visible = 'off';   % hidden unless PSC mode is toggled ON
+
+
+% --- Prevent sidebar from drifting too far down ---
+Y = max(Y, BOTTOM_RESERVED + 0.02);
+
+%% =========================================================================
+% HELP / INFO AND CLOSE BUTTONS
+% =========================================================================
+% These sit at the bottom of the sidebar. "Help" shows a scrollable window
+% with usage instructions. "Close" shuts down the GUI safely.
+%
+uicontrol(sidebar,'Style','pushbutton','String','Help / Info',...
+    'Units','normalized','Position',[0.05 0.01 0.40 0.042],...
+    'FontSize',12,'FontWeight','bold',...
+    'BackgroundColor',[0.20 0.20 0.60],'ForegroundColor','w',...
+    'Callback',@showHelpWindow);
+
+uicontrol(sidebar,'Style','pushbutton','String','Close Viewer',...
+    'Units','normalized','Position',[0.55 0.01 0.40 0.042],...
+    'FontSize',12,'FontWeight','bold',...
+    'BackgroundColor',[0.60 0 0],'ForegroundColor','w',...
+    'Callback',@(src,event) close(fig));
+
+
+
+%% =========================================================================
+% MAIN IMAGE AXIS (ax1)
+% =========================================================================
+% This axis displays the current fUSI frame (2D slice). It supports:
+%   - rotated images (for correct orientation)
+%   - overlaying ROI rectangles
+%   - anatomical L/R labels
+%
+ax1 = axes('Parent',fig,'Units','normalized',...
+    'Position',[0.23 0.55 0.72 0.43],...   % top-right region of window
+    'Color','k','XColor','w','YColor','w');
+hold(ax1,'on');
+axis(ax1,'image');   % preserve aspect ratio
+axis(ax1,'off');     % no ticks
+
+% INITIAL FRAME SELECTION
+if dims == 4
+    % For 4D data: pick middle Z slice for initial display
+    currentZ = round(Nz/2);
+    frame0 = I(:,:,currentZ,1);
+else
+    % For 3D data
+    currentZ = 1;
+    frame0 = I(:,:,1);
+end
+
+% Create the displayed image handle
+% Apply normalizeVol (scales intensities to [0,1])
+% Rot90(…,2) flips orientation vertically & horizontally for correct anatomy.
+frameH = imagesc(ax1, rot90(normalizeVol(frame0),2));
+colormap(ax1,'gray');     % default grayscale
+set(ax1,'CLim',[0 1]);    % force display range
+
+
+
+%% =========================================================================
+% ANATOMICAL LEFT / RIGHT LABELS
+% =========================================================================
+% These red labels overlay on the top of the image to indicate orientation.
+%
+L_text = text(ax1, 5, Ny*0.91, 'Left', ...
+    'Color','r', 'FontSize',18, 'FontWeight','bold', ...
+    'HorizontalAlignment','left', 'VerticalAlignment','middle');
+
+R_text = text(ax1, Nx-15, Ny*0.91, 'Right', ...
+    'Color','r', 'FontSize',18, 'FontWeight','bold', ...
+    'HorizontalAlignment','right', 'VerticalAlignment','middle');
+
+
+
+%% =========================================================================
+% TIME LABEL (Above image)
+% =========================================================================
+% Shows:
+%   Slice: #
+%   Frame: #
+%   Time:  t seconds
+%
+timeLabel = uicontrol(fig,'Style','text',...
+    'Units','normalized','Position',[0.23 0.950 0.72 0.03],...
+    'ForegroundColor','w','BackgroundColor','k',...
+    'HorizontalAlignment','center','FontSize',13,...
+    'String','Slice: 1   Frame: 1   Time: 0.0 s');
+
+
+
+%% =========================================================================
+% TIMECOURSE AXIS (ax2)
+% =========================================================================
+% This axis displays:
+%   - live ROI preview timecourse
+%   - stored ROI curves (when clicked)
+%
+ax2 = axes('Parent',fig,'Units','normalized',...
+    'Position',[0.23 0.08 0.72 0.40],...
+    'Color','k','XColor','w','YColor','w');
+hold(ax2,'on');
+
+xlabel(ax2,'Time (s)','Color','w');
+ylabel(ax2,'Intensity [AU]','Color','w');
+
+% The green line showing the LIVE preview of ROI
+hLive = plot(ax2,(0:T-1)*TR, zeros(1,T), ...
+             'LineWidth',2,'Color',[0 1 0]);
+
+
+
+%% =========================================================================
+% ROI STORAGE + LIVE ROI RECTANGLE
+% =========================================================================
+% ROI structs store:
+%   x1,x2,y1,y2 = pixel coordinates
+%   z           = slice index
+%   color       = drawing color
+%
+% roiHandles = rectangles drawn on ax1
+% roiPlots   = corresponding timecourses plotted on ax2
+%
+roiColors  = [1 0 0; 0 1 0; 0.3 0.3 1; 1 1 0; 1 0.5 0; 0 1 1; 1 0 1];
+ROI        = struct('x1',{},'x2',{},'y1',{},'y2',{},'z',{},'color',{});
+roiHandles = [];
+roiPlots   = [];
+
+% Mouse position updated continuously by window motion callback
+mousePos = [NaN NaN];
+
+% Create the red "live ROI" preview rectangle
+roiLive = rectangle(ax1,'Position',[1 1 1 1],...
+    'EdgeColor',[1 0 0],'LineWidth',2,'Visible','off');
+
+% Capture mouse movement
+set(fig,'WindowButtonMotionFcn',@(~,~) updateMousePos);
+
+% Function that tracks the current mouse coordinates
+function updateMousePos
+    if ~isvalid(ax1), return; end
+    C = get(ax1,'CurrentPoint');
+    mousePos = round([C(1,1) C(1,2)]);   % round to pixel indices
+end
+
+%% =========================================================================
+% PLAYBACK PANEL — CLEAN, STABLE, WORKING VERSION (Option A)
+% =========================================================================
+playbackPanel = uipanel(fig,'Units','normalized',...
+    'Position',[0.78 0.82 0.20 0.15],...
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'BorderType','etchedin');
+
+%% ---------------- PLAY BUTTON ----------------
+playBtn = uicontrol(playbackPanel,'Style','pushbutton','String','Play',...
+    'Units','normalized','Position',[0.04 0.55 0.22 0.35],...
+    'FontSize',12,'FontWeight','bold',...
+    'BackgroundColor',[0.0 0.6 0.0],'ForegroundColor','w',...
+    'Callback',@togglePlay_A);
+
+%% ---------------- SPEED AREA ----------------
+uicontrol(playbackPanel,'Style','text','String','Speed (×)',...
+    'Units','normalized','Position',[0.30 0.78 0.65 0.18],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',11,'FontWeight','bold',...
+    'HorizontalAlignment','left');
+
+speedSlider = uicontrol(playbackPanel,'Style','slider',...
+    'Units','normalized','Position',[0.30 0.60 0.65 0.18],...
+    'Min',0,'Max',4,'Value',1.0,...
+    'SliderStep',[0.02 0.10],...
+    'BackgroundColor',[0.25 0.25 0.25]);
+
+speedText = uicontrol(playbackPanel,'Style','text',...
+    'Units','normalized','Position',[0.30 0.44 0.65 0.15],...
+    'ForegroundColor',[0.7 1 0.7],...
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',10,'FontWeight','bold',...
+    'HorizontalAlignment','left',...
+    'String','Speed: 1.00×');
+
+speedSlider.Callback = @(s,~) ...
+    set(speedText,'String',sprintf('Speed: %.2f×',s.Value));
+
+%% ---------------- LOOP CHECKBOX ----------------
+loopBox = uicontrol(playbackPanel,'Style','checkbox','String','Loop',...
+    'Units','normalized','Position',[0.75 0.43 0.20 0.18],...
+    'ForegroundColor','w','BackgroundColor',[0.12 0.12 0.12],...
+    'Value',1);
+
+%% ---------------- SCRUBBER + TIME ----------------
+uicontrol(playbackPanel,'Style','text','String','Frame:',...
+    'Units','normalized','Position',[0.04 0.23 0.20 0.15],...
+    'ForegroundColor',[0.9 0.9 0.9],...
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',10,'FontWeight','bold',...
+    'HorizontalAlignment','left');
+
+frameTimeLabel = uicontrol(playbackPanel,'Style','text',...
+    'Units','normalized','Position',[0.75 0.23 0.20 0.15],...
+    'ForegroundColor',[0.7 0.9 1],...
+    'BackgroundColor',[0.12 0.12 0.12],...
+    'FontSize',10,'FontWeight','bold',...
+    'HorizontalAlignment','right',...
+    'String','0.00 s');
+
+frameScrubber = uicontrol(playbackPanel,'Style','slider',...
+    'Units','normalized','Position',[0.04 0.05 0.91 0.18],...
+    'Min',1,'Max',T,'Value',1,...
+    'SliderStep',[1/(T-1) 10/(T-1)],...
+    'BackgroundColor',[0.25 0.25 0.25],...
+    'Callback',@jumpFrame_A);
+
+%% =========================================================================
+% REQUIRED HIDDEN INTERNAL FRAME SLIDER
+% =========================================================================
+frameSlider = uicontrol(fig,'Style','slider',...
+    'Units','normalized','Position',[0.23 0.01 0.72 0.02],...
+    'Min',1,'Max',T,'Value',1,...
+    'Visible','off',...
+    'SliderStep',[1/(T-1) 10/(T-1)]);
+
+%% =========================================================================
+% TIMERS
+% =========================================================================
+refreshTimer = timer('ExecutionMode','fixedRate','Period',0.10,...
+    'TimerFcn',@updateFrame,'BusyMode','drop');
+start(refreshTimer);
+
+playTimer = timer('ExecutionMode','fixedRate','Period',0.10,...
+    'TimerFcn',@stepPlayback_A,'BusyMode','drop');
+
+%% =========================================================================
+% NESTED FUNCTIONS MUST COME AFTER EVERYTHING ABOVE
+% =========================================================================
+
+function jumpFrame_A(s,~)
+    newF = round(s.Value);
+    currentFrame = newF;
+    frameSlider.Value = newF;          % internal
+    frameTimeLabel.String = sprintf('%.2f s',(newF-1)*TR);
+    updateFrame();
+end
+
+function togglePlay_A(~,~)
+    if strcmp(playTimer.Running,'off')
+        playBtn.String = 'Pause';
+        playBtn.BackgroundColor = [0.8 0.4 0.0];
+        start(playTimer);
+    else
+        playBtn.String = 'Play';
+        playBtn.BackgroundColor = [0.0 0.6 0.0];
+        stop(playTimer);
+    end
+end
+
+function stepPlayback_A(~,~)
+    currentSpeed = speedSlider.Value;
+    if currentSpeed < 1e-3, return; end
+
+    currentFrame = currentFrame + currentSpeed;
+
+    if currentFrame > T
+        if loopBox.Value
+            currentFrame = 1;
+        else
+            stop(playTimer);
+            playBtn.String = 'Play';
+            playBtn.BackgroundColor = [0.0 0.6 0.0];
+            return;
+        end
+    end
+
+    frameSlider.Value = currentFrame;      % internal
+    frameScrubber.Value = currentFrame;    % visible
+    frameTimeLabel.String = sprintf('%.2f s',(currentFrame-1)*TR);
+    updateFrame();
+end
+
+
+
+%% =========================================================================
+% FILTER ENGINE — Applies HP/LP/BP filtering to timecourses only
+% =========================================================================
+% This function performs frequency filtering on a 1D timecourse.
+% It does NOT alter the image itself, only the plotted ROI signals.
+%
+% Supported modes:
+%   1 = None
+%   2 = High-pass
+%   3 = Low-pass
+%   4 = Band-pass
+%
+
+
+%% =========================================================================
+% MOVING MEAN SPIKE SUPPRESSION (Timecourse only)
+%% =========================================================================
+%function sigOut = doMovMean(sigIn)
+
+  %  if ~movmeanToggle.Value
+     %   sigOut = sigIn;
+      %  return;
+    %end
+
+    win_sec = str2double(movmeanWindow.String);
+    %if isnan(win_sec) || win_sec <= 0
+       % sigOut = sigIn;
+        %return;
+   % end
+
+    % Convert seconds → samples
+    %win_samples = max(1, round(win_sec / TR))
+    win_samples = win_sec
+    % Odd window length looks nicer (centered)
+    %if mod(win_samples,2)==0
+        %win_samples = win_samples + 1;
+    %end
+
+    % Moving mean (omit NaNs safely)
+    %sigOut = movmean(sigIn, win_samples, 'omitnan');
+%end
+
+%% =========================================================================
+% MOVING MEAN SPIKE SUPPRESSION (Timecourse only)
+%% =========================================================================
+function sigOut = doMovMean(sigIn)
+
+    % Optional spike suppression via moving average
+    % Operates on ROI timecourses only (no image data)
+
+    if ~movmeanToggle.Value
+        sigOut = sigIn;
+        return;
+    end
+
+    win_sec = str2double(movmeanWindow.String);
+    if isnan(win_sec) || win_sec <= 0
+        sigOut = sigIn;
+        return;
+    end
+
+    % Convert window from seconds → samples
+    win_samples = round(win_sec / TR);
+    win_samples = max(1, win_samples);
+
+    % Enforce odd window for symmetric (centered) averaging
+    if mod(win_samples,2) == 0
+        win_samples = win_samples + 1;
+    end
+
+    % Centered moving average (robust to NaNs)
+    sigOut = movmean(sigIn, win_samples, 'omitnan');
+end
+
+%% =========================================================================
+% ROBUST DESPIKING (MAD + interpolation)
+%% =========================================================================
+function [sigOut, spikeMask] = doDespikeMAD(sigIn)
+
+    % Operates on 1D ROI timecourses only
+    sigIn = double(sigIn(:)');
+    sigOut = sigIn;
+    spikeMask = false(size(sigIn));
+
+    if ~despikeToggle.Value
+        return;
+    end
+
+    zthr = str2double(despikeZ.String);
+    if isnan(zthr) || zthr < 2
+        zthr = 5;
+    end
+
+    % Robust statistics
+    med = median(sigIn,'omitnan');
+    madv = median(abs(sigIn - med),'omitnan');
+
+    if madv < eps
+        return;   % flat signal
+    end
+
+    % Robust z-score
+    robustZ = 0.6745 * (sigIn - med) / madv;
+    spikeMask = abs(robustZ) > zthr;
+
+    if ~any(spikeMask)
+        return;
+    end
+
+    x = 1:numel(sigIn);
+    good = ~spikeMask & ~isnan(sigIn);
+
+    if nnz(good) < 2
+        return;
+    end
+
+    % Replace spikes by linear interpolation
+    sigOut(spikeMask) = interp1(x(good), sigIn(good), ...
+                                x(spikeMask), 'linear', 'extrap');
+end
+
+function sigOut = doFiltering(sigIn)
+
+    mode   = get(filterDropdown,'Value');   % which filter chosen?
+    FcLow  = str2double(lowCut.String);     % HP / low BP boundary
+    FcHigh = str2double(highCut.String);    % LP / high BP boundary
+    order  = str2double(filterOrder.String);
+
+    % Safety defaults
+    if isnan(FcLow),  FcLow  = 0.05; end
+    if isnan(FcHigh), FcHigh = 0.20; end
+    if isnan(order),  order  = 4;    end
+
+    Fs = 1/TR;     % sampling frequency (Hz)
+
+    switch mode
+
+        case 1  % None
+            sigOut = sigIn;
+
+        case 2  % High-pass filter
+            Wn = FcLow/(Fs/2);
+            % Clamp cutoff to valid range
+            [b,a] = butter(order, max(Wn,0.001), 'high');
+            sigOut = filtfilt(b,a,double(sigIn));
+
+        case 3  % Low-pass filter
+            Wn = FcHigh/(Fs/2);
+            % Clamp cutoff to valid range
+            [b,a] = butter(order, min(Wn,0.999), 'low');
+            sigOut = filtfilt(b,a,double(sigIn));
+
+        case 4  % Band-pass
+            Wlow  = max(FcLow/(Fs/2), 0.001);
+            Whigh = min(FcHigh/(Fs/2), 0.999);
+
+            % Ensure a minimum valid bandwidth
+            if Whigh <= Wlow
+                Whigh = Wlow + 0.05;
+            end
+
+            [b,a] = butter(order, [Wlow Whigh], 'bandpass');
+            sigOut = filtfilt(b,a,double(sigIn));
+    end
+end
+
+
+
+%% =========================================================================
+% FRAME UPDATE FUNCTION — Called repeatedly by refreshTimer
+% =========================================================================
+function updateFrame(~,~)
+
+    currentFrame = round(frameSlider.Value);   % update frame index
+
+    % ---------------------------------------------------------------
+    % Load raw + PSC frame depending on dimensionality
+    % ---------------------------------------------------------------
+    if dims == 4
+        currentZ = round(sliceSlider.Value);
+        Fraw = I(:,:,currentZ,currentFrame);
+        Fpsc = PSC(:,:,currentZ,currentFrame);
+    else
+        currentZ = 1;
+        Fraw = I(:,:,currentFrame);
+        Fpsc = PSC(:,:,currentFrame);
+    end
+
+    % ---------------------------------------------------------------
+    % Apply display mode selection
+    % ---------------------------------------------------------------
+    mode = get(displayDropdown,'Value');
+    switch mode
+        case 1
+            F = normalizeVol(Fraw);   % raw normalized to [0,1]
+        case 2
+            F = normalizeVol(Fraw);   % same normalization
+        case 3
+            F = normalizeVol(Fpsc);   % PSC image
+    end
+
+    % ---------------------------------------------------------------
+    % Apply brightness / contrast / gamma / histEQ
+    % ---------------------------------------------------------------
+    F = F * contrast.Value + brightness.Value;
+    F = max(0, min(1, F));          % clamp to [0,1]
+
+    % Gamma correction
+    F = F.^gammaSlider.Value;
+
+    % Histogram equalization (optional)
+    if histEQ.Value
+        F = histeq(F);
+    end
+
+    % Draw the updated frame — rotated & flipped for correct anatomy
+    set(frameH,'CData', fliplr(rot90(F,2)));
+
+
+    % ---------------------------------------------------------------
+    % Update colormap
+    % ---------------------------------------------------------------
+    maps = {'gray','hot'};
+    colormap(ax1, maps{ get(mapDropdown,'Value') });
+
+
+    % ---------------------------------------------------------------
+    % Update time label above image
+    % ---------------------------------------------------------------
+    t_s = (currentFrame - 1) * TR;
+    timeLabel.String = sprintf('Slice: %d   Frame: %d/%d   Time: %.2f s',...
+                               currentZ, currentFrame, T, t_s);
+
+
+    % ---------------------------------------------------------------
+    % IF LIVE ROI IS DISABLED ? STOP HERE (fast mode)
+    % ---------------------------------------------------------------
+    if ~liveROI_enabled
+        roiLive.Visible = 'off';
+        set(hLive,'YData',zeros(1,T));
+        drawnow limitrate;
+        return;
+    end
+
+
+    % ---------------------------------------------------------------
+    % LIVE ROI PREVIEW (updates only while hovering)
+    % ---------------------------------------------------------------
+    x = mousePos(1);
+    y = mousePos(2);
+
+    % Out-of-bounds check
+    if isnan(x) || x<1 || x>Nx || isnan(y) || y<1 || y>Ny
+        roiLive.Visible = 'off';
+        return;
+    end
+
+    % ROI box size
+    rs  = round(roiSlider.Value);
+    hlf = floor(rs/2);
+
+    x1 = max(1, x-hlf);   x2 = min(Nx, x+hlf);
+    y1 = max(1, y-hlf);   y2 = min(Ny, y+hlf);
+
+    % Cycle color based on number of existing ROIs
+    nextColor = roiColors(mod(numel(ROI),size(roiColors,1))+1,:);
+
+    % Update live ROI box position
+    set(roiLive,'Position',[x1 y1 x2-x1+1 y2-y1+1],...
+        'Visible','on','EdgeColor',nextColor);
+
+    % ---------------------------------------------------------------
+    % Extract timecourse for preview ROI
+    % ---------------------------------------------------------------
+       % ---------------------------------------------------------------
+    % Extract timecourse for preview ROI  (FIX: map GUI-y -> data-y)
+    % ---------------------------------------------------------------
+    y1d = Ny - y2 + 1;
+    y2d = Ny - y1 + 1;
+
+    if dims == 3
+        tc_raw = squeeze(mean(mean(I(y1d:y2d, x1:x2, :),1),2));
+        tc_psc = squeeze(mean(mean(PSC(y1d:y2d, x1:x2, :),1),2));
+    else
+        tc_raw = squeeze(mean(mean(I(y1d:y2d, x1:x2, currentZ, :),1),2));
+        tc_psc = squeeze(mean(mean(PSC(y1d:y2d, x1:x2, currentZ, :),1),2));
+    end
+
+    tc_raw = tc_raw(:)';
+
+    % Normalize raw ? 0..1
+    mn = min(tc_raw);
+    rg = max(tc_raw)-mn;  if rg==0, rg = 1; end
+    tc_norm = (tc_raw - mn)/rg;
+
+    % Decide which timecourse to display (USE GUI directly!!)
+displayMode = get(displayDropdown,'Value');
+
+switch displayMode
+    case 1
+        tc = tc_raw;
+    case 2
+        tc = tc_norm;
+    case 3
+        tc = tc_psc;
+end
+
+    % Apply filter engine
+   tc = doMovMean(tc);     % spike suppression
+   [tc, ~] = doDespikeMAD(tc);   % robust spike removal
+tc = doFiltering(tc);  % frequency filtering
+
+
+    % Update live preview curve
+    set(hLive,'YData',tc,'Color',nextColor);
+
+    drawnow limitrate;
+end
+
+
+
+%% =========================================================================
+% PLAYBACK FUNCTIONS (Play / Pause / Increment Frames)
+% =========================================================================
+function togglePlay(~,~)
+    if strcmp(playTimer.Running,'off')
+        % PLAY
+        playBtn.String = 'Pause';
+        playBtn.BackgroundColor = [0.8 0.4 0.0];
+        start(playTimer);
+    else
+        % PAUSE
+        playBtn.String = 'Play';
+        playBtn.BackgroundColor = [0.0 0.6 0.0];
+        stop(playTimer);
+    end
+end
+
+function stepPlayback(~,~)
+    currentSpeed = speedSlider.Value;
+    currentFrame = currentFrame + currentSpeed;
+
+    % Loop logic
+    if currentFrame > T
+        if loopBox.Value
+            currentFrame = 1;
+        else
+            stop(playTimer);
+            playBtn.String = 'Play';
+            return;
+        end
+    end
+
+    frameSlider.Value = currentFrame;
+    updateFrame();
+end
+
+function setFrame(f)
+    currentFrame = f;
+    updateFrame([],[]);
+end
+
+
+
+%% =========================================================================
+% ROI CLICK HANDLER
+% LEFT-CLICK = Add ROI
+% RIGHT-CLICK = Remove nearest ROI
+% =========================================================================
+function mouseClick(~,~)
+
+    % ROI disabled? Nothing should happen.
+    if ~liveROI_enabled
+        return;
+    end
+
+    type = get(fig,'SelectionType'); % determine left or right click
+    x = mousePos(1);
+    y = mousePos(2);
+
+    if isnan(x) || x<1 || x>Nx || isnan(y) || y<1 || y>Ny
+        return;
+    end
+
+    rs  = round(roiSlider.Value);
+    hlf = floor(rs/2);
+
+    x1 = max(1,x-hlf);   x2 = min(Nx,x+hlf);
+    y1 = max(1,y-hlf);   y2 = min(Ny,y+hlf);
+
+    % =====================================================================
+    % LEFT CLICK ? ADD ROI
+    % =====================================================================
+    if strcmp(type,'normal')
+
+        col = roiColors(mod(numel(ROI),size(roiColors,1))+1,:);
+
+        % Add ROI struct
+        ROI(end+1) = struct('x1',x1,'x2',x2,'y1',y1,'y2',y2,...
+                            'z',currentZ,'color',col);
+
+        % Draw ROI rectangle
+        r = rectangle(ax1,'Position',[x1 y1 x2-x1+1 y2-y1+1],...
+                      'EdgeColor',col,'LineWidth',2);
+        roiHandles(end+1) = r;
+
+               % Compute full timecourse for stored ROI (FIX: map GUI-y -> data-y)
+        y1d = Ny - y2 + 1;
+        y2d = Ny - y1 + 1;
+
+        if dims==3
+            tc_raw = squeeze(mean(mean(I(y1d:y2d, x1:x2, :),1),2));
+            tc_psc = squeeze(mean(mean(PSC(y1d:y2d, x1:x2, :),1),2));
+        else
+            tc_raw = squeeze(mean(mean(I(y1d:y2d, x1:x2, currentZ, :),1),2));
+            tc_psc = squeeze(mean(mean(PSC(y1d:y2d, x1:x2, currentZ, :),1),2));
+        end
+
+
+        tc_raw = tc_raw(:)';
+
+        mn = min(tc_raw);
+        rg = max(tc_raw)-mn; if rg==0, rg=1; end
+        tc_norm = (tc_raw - mn)/rg;
+
+% --------------------------------------------------------------------------------
+% Mode selection (CORRECT ORIGINAL v7 BEHAVIOR)
+% Always read from display dropdown directly
+% --------------------------------------------------------------------------------
+displayMode = get(displayDropdown,'Value');
+
+switch displayMode
+    case 1
+        tc_final = tc_raw;
+    case 2
+        tc_final = tc_norm;
+    case 3
+        tc_final = tc_psc;
+end
+
+
+
+       tc_final = doMovMean(tc_final);   % spike suppression
+       [tc_final, ~] = doDespikeMAD(tc_final);
+tc_final = doFiltering(tc_final); % frequency filtering
+
+
+        % Plot persistent ROI curve
+        h = plot(ax2,(0:T-1)*TR, tc_final,'Color',col,'LineWidth',2);
+        roiPlots(end+1) = h;
+
+
+    % =====================================================================
+    % RIGHT CLICK ? REMOVE NEAREST ROI
+    % =====================================================================
+    elseif strcmp(type,'alt')
+
+        if isempty(ROI), return; end
+
+        % Compute distances to all ROI centers
+        centers = zeros(numel(ROI),2);
+        for k = 1:numel(ROI)
+            centers(k,:) = [(ROI(k).x1+ROI(k).x2)/2 , ...
+                            (ROI(k).y1+ROI(k).y2)/2];
+        end
+
+        d2 = sum((centers - [x y]).^2,2);
+        [~, idxMin] = min(d2);
+
+        % Delete ROI graphics + data
+        delete(roiHandles(idxMin));
+        delete(roiPlots(idxMin));
+
+        roiHandles(idxMin) = [];
+        roiPlots(idxMin)   = [];
+        ROI(idxMin)        = [];
+    end
+end
+
+
+
+%% =========================================================================
+% KEYBOARD SHORTCUTS
+% =========================================================================
+function keyPressHandler(~,event)
+    switch event.Key
+
+        case 'rightarrow'   % next slice (4D only)
+            if dims==4
+                sliceSlider.Value = min(Nz, sliceSlider.Value + 1);
+                updateFrame();
+            end
+
+        case 'leftarrow'    % prev slice
+            if dims==4
+                sliceSlider.Value = max(1, sliceSlider.Value - 1);
+                updateFrame();
+            end
+
+        case 'uparrow'      % increase ROI size
+            roiSlider.Value = min(150, roiSlider.Value + 1);
+
+        case 'downarrow'    % decrease ROI size
+            roiSlider.Value = max(2, roiSlider.Value - 1);
+
+        case 'space'        % play/pause
+            togglePlay();
+    end
+end
+
+
+
+%% =========================================================================
+% SCROLL WHEEL = SLICE NAVIGATION (4D only)
+% =========================================================================
+function mouseWheelScroll(~,event)
+    if dims ~= 4
+        return;
+    end
+    v = sliceSlider.Value - event.VerticalScrollCount;
+    sliceSlider.Value = max(1,min(Nz,v));
+    updateFrame();
+end
+
+
+
+%% =========================================================================
+% LIVE ROI TOGGLE BUTTON
+% =========================================================================
+function toggleLiveROI(src,~)
+    liveROI_enabled = src.Value;
+
+    if liveROI_enabled
+        src.String = 'ON';
+        src.BackgroundColor = [0 0.5 0];
+    else
+        src.String = 'OFF';
+        src.BackgroundColor = [0.5 0 0];
+        roiLive.Visible = 'off';
+        set(hLive,'YData',zeros(1,T));
+    end
+end
+
+
+
+%% =========================================================================
+% DISPLAY MODE HANDLER ? PSC PANEL visibility
+% =========================================================================
+function togglePSCpanel(~,~)
+    mode = get(displayDropdown,'Value');
+
+    if mode == 3         % PSC mode
+        PSCpanel.Visible = 'on';
+        ylabel(ax2,'% Signal Change [%]','Color','w');
+    else
+        PSCpanel.Visible = 'off';
+        ylabel(ax2,'Intensity [AU]','Color','w');
+    end
+end
+
+
+
+%% =========================================================================
+% FILTER UI HANDLER — Show high cutoff input only for band-pass mode
+% =========================================================================
+function toggleBandpass(~,~)
+    if get(filterDropdown,'Value') == 4
+        set(highCut,'Visible','on');
+    else
+        set(highCut,'Visible','off');
+    end
+end
+
+
+
+%% =========================================================================
+% RECALCULATE PSC (using user-defined baseline window)
+% =========================================================================
+function recalcPSCfunc(~,~)
+
+    t1 = str2double(baseStart.String);   % start time in seconds
+    t2 = str2double(baseEnd.String);     % end time in seconds
+
+    % Basic validation
+    if isnan(t1) || isnan(t2) || t1>=t2
+        errordlg('Invalid baseline range.');
+        return;
+    end
+
+    % Convert seconds ? frame indices
+    f1 = max(1, round(t1/TR));
+    f2 = min(T, round(t2/TR));
+
+    fprintf('Recomputing PSC: frames %d to %d\n', f1, f2);
+
+    if dims==3
+        base_new = mean(I(:,:,f1:f2),3);
+        PSC      = (I - base_new)./base_new * 100;
+    else
+        base_new = mean(I(:,:,:,f1:f2),4);
+        PSC      = bsxfun(@rdivide, bsxfun(@minus,I,base_new),base_new) * 100;
+    end
+
+    updateFrame();
+end
+
+
+
+%% =========================================================================
+%   HELP WINDOW (Extended Full Manual)
+% =========================================================================
+function showHelpWindow(~,~)
+
+    helpFig = figure('Name','Help & User Manual','Color','k',...
+        'Position',[350 200 900 700]);
+
+    uicontrol(helpFig,'Style','edit',...
+        'Units','normalized','Position',[0.03 0.03 0.94 0.94],...
+        'Max',200,'Min',1,...
+        'BackgroundColor',[0.12 0.12 0.12],...
+        'ForegroundColor','w','FontSize',12,...
+        'HorizontalAlignment','left',...
+        'String',{ ...
+        '====================  fUSI Live Viewer v8 — USER MANUAL  ===================='; ...
+        ''; ...
+        'PURPOSE:'; ...
+        '  This viewer enables interactive exploration of 2D/3D/4D functional'; ...
+        '  ultrasound (fUSI) datasets including timecourses, ROI analysis, and PSC.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '1) DATA LOADING'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Load a .mat file containing a numeric fUSI array + metadata struct.'; ...
+        '  • Supports Daxasonics (Y,X,T) and Matrix Probe (Y,X,Z,T).'; ...
+        '  • TR is detected automatically from metadata.time.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '2) DISPLAY MODES'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  RAW:'; ...
+        '     Normalizes the slice to [0–1]. Shows absolute intensity changes.'; ...
+        ''; ...
+        '  NORMALIZED:'; ...
+        '     Dynamic frame-wise normalization; enhances visibility of contrast changes.'; ...
+        ''; ...
+        '  % SIGNAL CHANGE (PSC):'; ...
+        '     PSC = (I - baseline)/baseline × 100'; ...
+        '     Baseline window can be set manually.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '3) BRIGHTNESS / CONTRAST / GAMMA / HIST-EQ'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Brightness: shifts display intensity.'; ...
+        '  • Contrast: scales image intensity.'; ...
+        '  • Gamma: redistributes midtones (F.^gamma).'; ...
+        '  • Histogram Equalization: redistributes histogram for stronger contrast.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '4) ROI TOOLS'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  LIVE ROI PREVIEW:'; ...
+        '     • Hover mouse ? shows temporary ROI box.'; ...
+        '     • Live timecourse updates in real time.'; ...
+        '     • No ROI gets stored.'; ...
+        ''; ...
+        '  FIXED ROI (LEFT CLICK):'; ...
+        '     • Creates a square ROI at mouse location.'; ...
+        '     • Timecourse is saved to bottom panel.'; ...
+        '     • Multiple ROIs allowed; each gets its own color.'; ...
+        ''; ...
+        '  DELETE ROI (RIGHT CLICK):'; ...
+        '     • Removes nearest ROI (based on center distance).'; ...
+        ''; ...
+        '  ROI SIZE:'; ...
+        '     • Adjustable 2–150 px using slider or ?/?.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '5) FILTERING (Timecourse Only)'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • High-pass, Low-pass, and Band-pass Butterworth filters available.'; ...
+        '  • Filtering applies ONLY to timecourses (not image frames).'; ...
+        '  • Order and cutoff frequencies fully configurable.'; ...
+        '  • filtfilt ensures zero-phase distortion.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '6) PSC BASELINE CONFIGURATION'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Only active in PSC mode.'; ...
+        '  • Set baseline start/end in seconds.'; ...
+        '  • Click "Recalculate PSC" to rebuild PSC map.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '7) PLAYBACK CONTROLS'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Play/Pause button for animation.'; ...
+        '  • Speed slider (0.1× to 4×).'; ...
+        '  • Loop checkbox repeats video.'; ...
+        '  • Frame slider for manual scrubbing.'; ...
+        ''; ...
+        '  KEYBOARD SHORTCUTS:'; ...
+        '     Space     ? Play/Pause'; ...
+        '     ? / ?      ? Increase/decrease ROI size'; ...
+        '     ? / ?      ? Next/prev slice (4D only)'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '8) SLICE NAVIGATION (4D ONLY)'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Slice slider controls Z-plane.'; ...
+        '  • Scroll wheel also changes slice.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '9) IMAGE ORIENTATION'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  Frame displayed as:  fliplr(rot90(F,2))'; ...
+        '  Ensures neurological orientation (Left on left, Right on right).'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '10) PERFORMANCE MODES'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  LIVE ROI OFF (FAST MODE):'; ...
+        '     • Highest frame rate.'; ...
+        '     • All ROI calculations disabled.'; ...
+        ''; ...
+        '  LIVE ROI ON:'; ...
+        '     • Live preview active.'; ...
+        '     • Higher CPU cost due to constant averaging.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '11) TROUBLESHOOTING'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  • Slow playback? Disable Live ROI.'; ...
+        '  • Wrong PSC baseline? Recalculate using correct window.'; ...
+        '  • Wrong orientation? Viewer applies fixed neurological layout.'; ...
+        ''; ...
+        '-------------------------------------------------------------------------------'; ...
+        '-------------------------------------------------------------------------------'; ...
+'-------------------------------------------------------------------------------'; ...
+'12) SPIKE SUPPRESSION — MOVING AVERAGE (MOVMEAN)'; ...
+'-------------------------------------------------------------------------------'; ...
+'  • Applies a centered moving average to ROI timecourses only.'; ...
+'  • Window length is defined in seconds and converted to samples using TR.'; ...
+''; ...
+'  MATHEMATICAL OPERATION:'; ...
+'  • For a signal x(t), each point is replaced by:'; ...
+'        y(t) = (1/N) * Σ x(t+k),  k = -N/2 ... +N/2'; ...
+'    where N is the window length in samples.'; ...
+''; ...
+'  WHAT THIS MEANS:'; ...
+'  • Each time point becomes the local mean of its neighborhood.'; ...
+'  • High-frequency components are attenuated.'; ...
+'  • Sharp transients (spikes) are smoothed but not removed.'; ...
+''; ...
+'  EFFECT:'; ...
+'  • Reduces noise variance.'; ...
+'  • Preserves slow trends.'; ...
+'  • Spreads spikes across neighboring samples.'; ...
+''; ...
+'  IMPORTANT:'; ...
+'  • Moving average is a LOW-PASS smoothing operation.'; ...
+'  • It does NOT detect or remove outliers.'; ...
+'  • Use only for visualization or gentle smoothing.'; ...
+''; ...
+'-------------------------------------------------------------------------------'; ...
+'13) SPIKE SUPPRESSION — ROBUST DESPIKING (MAD + INTERPOLATION)'; ...
+'-------------------------------------------------------------------------------'; ...
+'  • Detects and replaces transient outliers in ROI timecourses.'; ...
+'  • Uses robust statistics that are insensitive to extreme values.'; ...
+''; ...
+'  STEP 1: ROBUST Z-SCORE COMPUTATION'; ...
+'  • Median of signal:'; ...
+'        m = median(x)'; ...
+'  • Median Absolute Deviation (MAD):'; ...
+'        MAD = median(|x - m|)'; ...
+''; ...
+'  • Robust z-score:'; ...
+'        z(t) = 0.6745 * (x(t) - m) / MAD'; ...
+'    (0.6745 rescales MAD to match standard deviation for Gaussian data.)'; ...
+''; ...
+'  STEP 2: SPIKE DETECTION'; ...
+'  • A time point is marked as a spike if:'; ...
+'        |z(t)| > Z_threshold so if A point that deviates more than Z_threshold robust standard deviations from the median.'; ...
+''; ...
+'  Z-THRESHOLD MEANING:'; ...
+'  • Controls sensitivity of spike detection.'; ...
+'  • Z = 5 means the point deviates ~5 robust SDs from the median.'; ...
+'  • Higher Z → fewer points detected (conservative).'; ...
+'  • Lower Z → more points detected (aggressive).'; ...
+''; ...
+'  STEP 3: SPIKE REPLACEMENT'; ...
+'  • Detected spikes are NOT deleted.'; ...
+'  • They are replaced using linear interpolation:'; ...
+'        x_spike(t) = interp(x_good)'; ...
+'  • Interpolation uses nearest non-spike neighbors.'; ...
+'  • It replaces detected spike points with linearly interpolated values computed from the nearest non-spike neighbors in time.'; ...
+'  • 2 neighbors total, one on each side are used to replace the spike. '; ...
+'  MATHEMATICAL MEANING (DESPIKING REPLACEMENT):'; ...
+'  '; ...
+'  Let:'; ...
+'    x(t)   = original ROI timecourse'; ...
+'    t_s    = time index of a detected spike'; ...
+'    t_1    = nearest previous non-spike time point'; ...
+'    t_2    = nearest next non-spike time point'; ...
+'  '; ...
+'  Then the spike value is replaced by linear interpolation:'; ...
+'  '; ...
+'    x_new(t_s) = x(t_1) + (t_s - t_1) / (t_2 - t_1) * ( x(t_2) - x(t_1) )'; ...
+'  '; ...
+'  This corresponds to a straight line between the closest clean points.'; ...
+''; ...
+'  WHAT THIS ACHIEVES:'; ...
+'  • Removes extreme transient artefacts.'; ...
+'  • Preserves signal continuity and slow dynamics.'; ...
+'  • Prevents spikes from contaminating filtering or averaging.'; ...
+''; ...
+'  RECOMMENDED VALUES:'; ...
+'  • Z = 4–6 : typical for fUSI / fMRI-like signals.'; ...
+'  • Z < 3   : risk of removing real signal.'; ...
+'  • Z > 8   : very conservative (few spikes removed).'; ...
+''; ...
+'  IMPORTANT:'; ...
+'  • Despiking operates ONLY on ROI timecourses.'; ...
+'  • Image data and stored volumes are never modified.'; ...
+'  • Intended for visualization and exploratory analysis.'; ...
+''; ...
+'-------------------------------------------------------------------------------'; ...
+
+        '14) CREDITS'; ...
+        '-------------------------------------------------------------------------------'; ...
+        '  Developed by Soner Caner Cagun'; ...
+        '  Enhanced & documented by ChatGPT'; ...
+        '  MPI for Biological Cybernetics'; ...
+        ''; ...
+        '=================== END OF USER MANUAL ==================='; ...
+        '' });
+
+end
+
+
+
+
+%% =========================================================================
+% FOOTER (Bottom-right)
+% =========================================================================
+footer = uicontrol(fig,'Style','text',...
+    'Units','normalized','Position',[0.23 0.01 0.75 0.03],...
+    'ForegroundColor',[0.8 0.8 0.8],'BackgroundColor','k',...
+    'HorizontalAlignment','right','FontSize',11,...
+   'String', sprintf('Soner Caner Cagun | MPI-B Cybernetics | fUSI Live Viewer v8 | %s', ...
+                        datestr(now,'yyyy mmm dd – HH:MM:SS')));
+
+
+
+%% =========================================================================
+% CLEANUP HANDLER — Stops timers & closes window safely
+% =========================================================================
+set(fig,'CloseRequestFcn',@cleanup);
+
+function cleanup(~,~)
+    try stop(refreshTimer); delete(refreshTimer); end
+    try stop(playTimer);   delete(playTimer);   end
+    delete(fig);
+end
+
+end   % END OF MAIN FUNCTION (fUSI_Live_v7)
+
+
+
+%% ========================================================================
+%% HELPER FUNCTION: normalizeVol — scales any volume to [0,1]
+%% ========================================================================
+function O = normalizeVol(V)
+    V = double(V);
+    V = V - min(V(:));
+    vmax = max(V(:));
+    if vmax > 0
+        V = V ./ vmax;
+    end
+    O = V;
+end
